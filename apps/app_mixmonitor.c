@@ -353,7 +353,52 @@ struct mixmonitor_ds {
 	struct ast_audiohook *audiohook;
 
 	unsigned int samp_rate;
+	uint64_t read_samples_written;
+	uint64_t write_samples_written;
+	uint64_t read_silence_samples_inserted;
+	uint64_t write_silence_samples_inserted;
+	unsigned int read_silence_log_shown;
+	unsigned int write_silence_log_shown;
 };
+
+static int mixmonitor_write_silence(struct ast_filestream *fs, const struct ast_format *format,
+	uint64_t samples)
+{
+	int16_t slin_silence[SAMPLES_PER_FRAME] = { 0, };
+
+	while (samples) {
+		struct ast_frame silence_frame = {
+			.frametype = AST_FRAME_VOICE,
+			.mallocd = 0,
+			.offset = 0,
+			.src = __PRETTY_FUNCTION__,
+			.data.ptr = slin_silence,
+		};
+		unsigned int chunk_samples = MIN(samples, ARRAY_LEN(slin_silence));
+
+		silence_frame.samples = chunk_samples;
+		silence_frame.datalen = chunk_samples * sizeof(slin_silence[0]);
+		ast_format_copy(&silence_frame.subclass.format, format);
+
+		if (ast_writestream(fs, &silence_frame)) {
+			return -1;
+		}
+
+		samples -= chunk_samples;
+	}
+
+	return 0;
+}
+
+
+static unsigned int mixmonitor_samples_to_ms(uint64_t samples, unsigned int samp_rate)
+{
+	if (!samp_rate) {
+		return 0;
+	}
+
+	return (unsigned int) ((samples * 1000ULL) / samp_rate);
+}
 
 /*!
  * \internal
@@ -665,7 +710,11 @@ static void *mixmonitor_thread(void *obj)
 				struct ast_frame *cur;
 
 				for (cur = fr_read; cur; cur = AST_LIST_NEXT(cur, frame_list)) {
-					ast_writestream(*fs_read, cur);
+					if (ast_writestream(*fs_read, cur)) {
+						continue;
+					}
+
+					mixmonitor->mixmonitor_ds->read_samples_written += cur->samples;
 				}
 			}
 
@@ -673,7 +722,39 @@ static void *mixmonitor_thread(void *obj)
 				struct ast_frame *cur;
 
 				for (cur = fr_write; cur; cur = AST_LIST_NEXT(cur, frame_list)) {
-					ast_writestream(*fs_write, cur);
+					if (ast_writestream(*fs_write, cur)) {
+						continue;
+					}
+
+					mixmonitor->mixmonitor_ds->write_samples_written += cur->samples;
+				}
+			}
+
+			if (*fs_read && *fs_write) {
+				if (mixmonitor->mixmonitor_ds->write_samples_written < mixmonitor->mixmonitor_ds->read_samples_written) {
+					uint64_t write_silence_samples = mixmonitor->mixmonitor_ds->read_samples_written - mixmonitor->mixmonitor_ds->write_samples_written;
+
+					if (!mixmonitor_write_silence(*fs_write, &format_slin, write_silence_samples)) {
+						mixmonitor->mixmonitor_ds->write_samples_written += write_silence_samples;
+						mixmonitor->mixmonitor_ds->write_silence_samples_inserted += write_silence_samples;
+						if (!mixmonitor->mixmonitor_ds->write_silence_log_shown) {
+							mixmonitor->mixmonitor_ds->write_silence_log_shown = 1;
+							ast_verb(1, "MixMonitor silence padding enabled for write stream on %s; summary will be reported at recording end\n",
+								mixmonitor->name);
+						}
+					}
+				} else if (mixmonitor->mixmonitor_ds->read_samples_written < mixmonitor->mixmonitor_ds->write_samples_written) {
+					uint64_t read_silence_samples = mixmonitor->mixmonitor_ds->write_samples_written - mixmonitor->mixmonitor_ds->read_samples_written;
+
+					if (!mixmonitor_write_silence(*fs_read, &format_slin, read_silence_samples)) {
+						mixmonitor->mixmonitor_ds->read_samples_written += read_silence_samples;
+						mixmonitor->mixmonitor_ds->read_silence_samples_inserted += read_silence_samples;
+						if (!mixmonitor->mixmonitor_ds->read_silence_log_shown) {
+							mixmonitor->mixmonitor_ds->read_silence_log_shown = 1;
+							ast_verb(1, "MixMonitor silence padding enabled for read stream on %s; summary will be reported at recording end\n",
+								mixmonitor->name);
+						}
+					}
 				}
 			}
 
@@ -725,6 +806,18 @@ static void *mixmonitor_thread(void *obj)
 	}
 
 	ast_verb(2, "End MixMonitor Recording %s\n", mixmonitor->name);
+	if (mixmonitor->mixmonitor_ds->read_silence_samples_inserted) {
+		ast_verb(1, "MixMonitor inserted a total of %u ms of silence into read stream (%llu samples) for %s\n",
+			mixmonitor_samples_to_ms(mixmonitor->mixmonitor_ds->read_silence_samples_inserted, mixmonitor->mixmonitor_ds->samp_rate),
+			(unsigned long long) mixmonitor->mixmonitor_ds->read_silence_samples_inserted,
+			mixmonitor->name);
+	}
+	if (mixmonitor->mixmonitor_ds->write_silence_samples_inserted) {
+		ast_verb(1, "MixMonitor inserted a total of %u ms of silence into write stream (%llu samples) for %s\n",
+			mixmonitor_samples_to_ms(mixmonitor->mixmonitor_ds->write_silence_samples_inserted, mixmonitor->mixmonitor_ds->samp_rate),
+			(unsigned long long) mixmonitor->mixmonitor_ds->write_silence_samples_inserted,
+			mixmonitor->name);
+	}
 	ast_test_suite_event_notify("MIXMONITOR_END", "File: %s\r\n", mixmonitor->filename);
 
 	if (!AST_LIST_EMPTY(&mixmonitor->recipient_list)) {
